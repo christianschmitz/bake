@@ -1,7 +1,5 @@
-module github.com/christianschmitz/build
+module github.com/christianschmitz/bake
 
 go 1.15
 
-require (
-	github.com/urfave/cli v1.22.5
-)
+require ()

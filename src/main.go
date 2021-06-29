@@ -3,312 +3,216 @@ package main
 import (
   "errors"
   "fmt"
-  "math"
   "os"
   "path/filepath"
-  "runtime"
-  "sync"
-
-  "github.com/urfave/cli"
-)
-
-const (
-  BUILD_CONFIG = "package.json"
-
-  REL_CACHE_DIR = "/.cache/build"
-)
-
-var (
-  VERSION = ""
-
-  ROOT_PATH = ""
-
-  CACHE_DIR = ""
-
-  INIT = false
-
-  MUTEX = &sync.RWMutex{}
-  UPDATED_OBJS = make(map[string]string)
-  UP_TO_DATE = true
-
-  FORCE = false
+  "strings"
 )
 
 func main() {
-  app := &cli.App{
-    Name: "build",
-    Version: VERSION,
-    Usage: "automatic compilation of cpp projects, without pesky configuration",
-    Flags: []cli.Flag{
-      cli.StringFlag{
-        Name: "d",
-        Destination: &ROOT_PATH,
-        Value: ROOT_PATH,
-      },
-      cli.BoolFlag{
-        Name: "init",
-        Destination: &INIT,
-      },
-      cli.BoolFlag{
-        Name: "f",
-        Destination: &FORCE,
-      },
-    },
-    Action: main_internal,
+  if err := mainInner(); err != nil {
+    fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+    os.Exit(1)
   }
-
-  app.RunAndExitOnError()
 }
 
-func CacheDir() string {
-  if CACHE_DIR == "" {
+func printUsage() {
+  var b strings.Builder
 
-    home := os.Getenv("HOME")
-    CACHE_DIR = filepath.Join(home, REL_CACHE_DIR)
-    if err := os.MkdirAll(CACHE_DIR, 0755); err != nil {
-      panic(err)
+  b.WriteString("bake [MODE | [TARGET]] [OPTIONS]\n")
+  b.WriteString("\nModes:\n")
+  b.WriteString("  --init            wizard to create new makefile recipe\n")
+  b.WriteString("  --project <type>  go or c\n")
+  b.WriteString("\nProject mode options:\n")
+  b.WriteString("  --compiler <compiler-cmd>\n")
+  b.WriteString("  --linker   <linker-cmd>\n")
+  b.WriteString("  --pch      <pch-cmd>\n")
+  b.WriteString("  --dst      <dst-dir>\n")
+  b.WriteString("\nGeneral options:\n")
+  b.WriteString("  -f/-B             force\n")
+  b.WriteString("  -n                dry-run\n")
+  b.WriteString("  -C <dir>          change directory\n")
+  b.WriteString("  -h                display this message\n")
+
+  fmt.Fprintf(os.Stderr, "%s", b.String())
+}
+
+func mainInner() error {
+  args := os.Args[1:]
+
+  if ContainsHelp(args) {
+    printUsage()
+    return nil
+  }
+
+  if len(args) == 0 {
+    return mainMake([]string{})
+  } else if strings.HasPrefix(args[0], "--") {
+    mode := args[0][2:]
+
+    switch mode {
+    case "init":
+      return mainBakeInit(args[1:])
+    case "project":
+      return mainBakeProject(args[1:])
+    default:
+      return errors.New("mode " + mode + " not recognized")
     }
+  } else if strings.HasPrefix(args[0], "-") {
+    return mainMake(args)
+  } else {
+    return mainMakeTarget(args[0], args[1:])
   }
-
-  return CACHE_DIR
 }
 
-func main_internal(c *cli.Context) error {
+func mainMake(args []string) error {
   var (
-    err       error
-    rootGiven bool
+    force  bool
+    dryRun bool
+    dir    string
   )
 
-  if ROOT_PATH == "" {
-    ROOT_PATH, err = os.Getwd()
-    if err != nil {
-      return err
-    }
-
-    rootGiven = false
-  } else {
-    ROOT_PATH, err = filepath.Abs(ROOT_PATH)
-    if err != nil {
-      return err
-    }
-
-    stat, err := os.Stat(ROOT_PATH); 
-    if os.IsNotExist(err) {
-      return errors.New("dir " + ROOT_PATH + " not found")
-    } else if err != nil {
-      return err
-    } else if !stat.IsDir() {
-      return errors.New(ROOT_PATH + " is not a directory")
-    }
-
-    rootGiven = true
+  rem, err := ParseGeneralArgsFindMakefile(args, &force, &dryRun, &dir)
+  if err != nil {
+    return err
   }
 
-  if INIT {
-    if len(c.Args()) != 0 {
-      return errors.New("unexpected args for -init")
-    }
-
-    return main_init(ROOT_PATH)
-  } else {
-    if !rootGiven {
-      curDir := ROOT_PATH
-      found := false
-      for len(curDir) > 1 {
-        fname := filepath.Join(curDir, BUILD_CONFIG)
-
-        stat, err := os.Stat(fname)
-        if err == nil {
-          if stat.IsDir() {
-            return errors.New(fname + " is directory")
-          }
-          found = true
-          break
-        }
-
-        curDir = filepath.Dir(curDir)
-      }
-
-      if !found {
-        return errors.New(BUILD_CONFIG + " not found")
-      } else {
-        ROOT_PATH = curDir
-      }
-    } else {
-      fname := filepath.Join(ROOT_PATH, BUILD_CONFIG)
-      if stat, err := os.Stat(fname); err != nil {
-        return err
-      } else if stat.IsDir() {
-        return errors.New(fname + " is a directory")
-      }
-    }
-
-    return main_build(ROOT_PATH, c.Args())
+  if err := AssertNoArgs(rem); err != nil {
+    return err
   }
+
+  cmdArgs, err := SetupMakeArgs(dir, force, dryRun)
+  if err != nil {
+    return err
+  }
+
+  return RunCommand("make", cmdArgs)
 }
 
-func main_build(path string, args []string) error {
-  if len(args) != 0 {
-    return errors.New("target spec not yet supported")
-  }
+// TODO: prompt for user input
+func buildBakeRecipe() string {
+  var b strings.Builder
 
-  cfg, err := ReadConfig(path)
+  b.WriteString("PROJECT_TYPE=\"c\"\n")
+  b.WriteString("CPP_DIALECT=\"c++2a\"\n")
+  b.WriteString("COMPILER_CMD=\"clang-11 -std=$(CPP_DIALECT) {include} -c {source} -o {output}\"\n")
+  b.WriteString("LINKER_CMD=\"clang-11 -std=$(CPP_DIALECT) {libs} -o {output} {objects}\"\n")
+  b.WriteString("EMIT_PCH_CMD=\"clang-11 -std=$(CPP_DIALECT) {include} {header} -o {output}\"\n")
+  b.WriteString("INCLUDE_PCH_OPTS=\"-include-pch {pch}\"\n")
+  b.WriteString("DST_DIR=\"./build/\"\n\n")
+  b.WriteString("compile:\n")
+  b.WriteString("\t@bake --project $(PROJECT_TYPE) --compiler $(COMPILER_CMD) --linker $(LINKER_CMD) --dst $(DST_DIR) --emit-pch $(EMIT_PCH_CMD) --include-pch $(INCLUDE_PCH_OPTS)")
+
+  return b.String()
+}
+
+func mainBakeInit(args []string) error {
+  var (
+    force  bool
+    dryRun bool
+    dir    string
+  )
+
+  rem, err := ParseGeneralArgsDefaultDirPwd(args, &force, &dryRun, &dir)
   if err != nil {
     return err
   }
 
-  // now read all the files into a data structure
-  repo, err := ReadDirsAndFiles(path)
+  if force && dryRun {
+    return errors.New("-f/-B and -n are conflicting flags for bake --init")
+  }
+
+  if err := AssertNoArgs(rem); err != nil {
+    return err
+  }
+
+  exists, err := MakefileExists(dir)
   if err != nil {
     return err
   }
 
-  if err := repo.ReadDeps(repo); err != nil {
-    return err
-  }
+  recipe := buildBakeRecipe()
 
-  if err := compileObjs(cfg, repo); err != nil {
-    os.Exit(1)
-    //return err
-  }
-
-  if err := compileExes(path, cfg, repo); err != nil {
-    return err
-  }
-
-  if UP_TO_DATE {
-    fmt.Println("up-to-date")
+  if force || (!dryRun && !exists) {
+    if err := WriteMakefile(dir, recipe); err != nil {
+      return err
+    }
+  } else {
+    fmt.Println(recipe)
   }
 
   return nil
 }
 
-func compileObjs(cfg *Config, repo *Dir) error {
-  cppFiles := make([]*File, 0)
-  if err := repo.WalkFiles(func (f *File) error {
-    if f.IsCPP() {
-      cppFiles = append(cppFiles, f)
-    }
+func mainMakeTarget(target string, args []string) error {
+  var (
+    force  bool
+    dryRun bool
+    dir    string
+  )
 
-    return nil
-  }); err != nil {
+  rem, err := ParseGeneralArgsFindMakefile(args, &force, &dryRun, &dir)
+  if err != nil {
     return err
   }
 
-  dirtyFiles := make([]*File, 0)
-  for _, cppFile := range cppFiles {
-    if !cppFile.ObjUpToDate() {
-      dirtyFiles = append(dirtyFiles, cppFile)
-    }
-  }
-
-  return RunPar(len(dirtyFiles), func(i int) error {
-    return dirtyFiles[i].Compile(cfg)
-  });
-}
-
-func IsUpdatedObj(obj string) bool {
-  MUTEX.RLock()
-
-  _, ok := UPDATED_OBJS[obj]
-
-  MUTEX.RUnlock()
-
-  return ok
-}
-
-func SetUpdatedObj(obj string) {
-  MUTEX.Lock()
-
-  UPDATED_OBJS[obj] = obj
-
-  UP_TO_DATE = false
-
-  MUTEX.Unlock()
-}
-
-func SetUpdatedExe(path string) {
-  MUTEX.Lock()
-
-  UP_TO_DATE = false
-
-  MUTEX.Unlock()
-}
-
-func RunPar(n int, fn func(i int) error) error {
-  nProc := runtime.NumCPU()
-
-  if nProc > n {
-    nProc = n
-  }
-
-  nGroups := int(math.Ceil(float64(n)/float64(nProc)))
-
-  errs := make([]error, n)
-
-  for iGroup := 0; iGroup < nGroups; iGroup++ {
-    groupSize := nProc
-    if iGroup == nGroups - 1 {
-      groupSize = n - iGroup*nProc
-    }
-
-    var wg sync.WaitGroup
-    wg.Add(groupSize)
-
-    for iThread := 0; iThread < groupSize; iThread++ {
-      go func(i int) {
-        errs[i] = fn(i)
-
-        wg.Done()
-      }(iThread + iGroup*nProc)
-    }
-
-    wg.Wait()
-
-    for _, err := range errs {
-      if err != nil {
-        return err
-      }
-    }
-
-  }
-
-  return nil
-}
-
-func compileExes(root string, cfg *Config, repo *Dir) error {
-  // create the exes
-  exeFiles := make([]*File, 0)
-  if err := repo.WalkFiles(func (f *File) error {
-    if f.ft == EXE_ENTRY {
-      exeFiles = append(exeFiles, f)
-    }
-
-    return nil
-  }); err != nil {
+  if err := AssertNoArgs(rem); err != nil {
     return err
   }
 
-  dstDir := cfg.Dst 
-  if !filepath.IsAbs(dstDir) {
-    dstDir = filepath.Join(root, cfg.Dst)
-  }
-
-  if err := os.MkdirAll(dstDir, 0755); err != nil {
+  isMakefileTarget, err := TargetExists(dir, target)
+  if err != nil {
     return err
   }
 
-  dirtyFiles := make([]*File, 0)
+  cmd := "make"
+  cmdArgs, err := SetupMakeArgs(dir, force, dryRun)
 
-  for _, exeFile := range exeFiles {
-    if !exeFile.ExeUpToDate(dstDir, repo) {
-      dirtyFiles = append(dirtyFiles, exeFile)
+  if isMakefileTarget {
+    cmdArgs = append(cmdArgs, target)
+  } else {
+    if err := os.Setenv("BAKE_TARGET", target); err != nil {
+      return err
     }
   }
 
-  return RunPar(len(dirtyFiles), func(i int) error {
-    exeFile := dirtyFiles[i]
+  return RunCommand(cmd, cmdArgs)
+}
 
-    return exeFile.LinkExe(cfg, dstDir, repo)
-  })
+func mainBakeProject(args []string) error {
+  pType := args[0]
+  args = args[1:]
+
+  var project Project
+  var err error
+
+  switch pType {
+  case "c":
+    project, err = NewCProject(args)
+  //case "go":
+    //project, err = NewGoProject(args)
+  default:
+    return errors.New("unrecognized project type " + pType)
+  }
+
+  if err != nil {
+    return err
+  }
+
+  home := os.Getenv("HOME")
+  CACHE_DIR = filepath.Join(home, CACHE_DIR_REL)
+  if err := os.MkdirAll(CACHE_DIR, 0755); err != nil {
+    return err
+  }
+
+  if err := project.ResolveDeps(); err != nil {
+    return err
+  }
+
+  bakeTarget := os.Getenv("BAKE_TARGET")
+
+  if bakeTarget != "" {
+    return project.BuildTarget(bakeTarget)
+  } else {
+    return project.Build()
+  }
 }

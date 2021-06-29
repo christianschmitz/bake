@@ -1,6 +1,6 @@
 export build = $(abspath ./build)
 
-cmd=build
+cmd=bake
 
 dst=$(addprefix $(build)/,$(cmd))
 
